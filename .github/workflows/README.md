@@ -102,13 +102,12 @@ requests read/write and Metadata read; nothing else, since bumps only touch
 `flake.lock`. Install the App on every repo in the cascade. In each such
 repo set the `CASCADE_APP_ID` variable (the App ID; the client ID also
 works) and the `CASCADE_APP_PRIVATE_KEY` secret. Sender repos also set the
-`CASCADE_CONSUMERS` variable (see below).
+optional `CASCADE_CONSUMERS` secret for private recipients (see below).
 
 The called workflows read their variables from the calling repository:
-GitHub resolves `vars.CASCADE_APP_ID` and `vars.CASCADE_CONSUMERS` in the
-caller's context, not in noamsto/.github. Set them in each sender and
-receiver repo, or as organization variables; nothing is needed in
-noamsto/.github.
+GitHub resolves `vars.CASCADE_APP_ID` in the caller's context, not in
+noamsto/.github. Set it in each sender and receiver repo, or as an
+organization variable; nothing is needed in noamsto/.github.
 
 "Allow auto-merge" is not needed: the workflow waits for CI itself. The App
 must not be a bypass actor in the receiver's rulesets. Commits are authored
@@ -123,9 +122,9 @@ Granting the App Workflows write avoids that.
 
 Runs in the sender. It notifies the union of the recipients in
 `.github/consumers.json` (optional; absent means none) and the caller's
-`CASCADE_CONSUMERS` repository variable, de-duplicated. Every entry must be
+`CASCADE_CONSUMERS` secret, de-duplicated. Every entry must be
 a `noamsto/<repo>` string matching `^noamsto/[A-Za-z0-9._-]+$`; a malformed
-file or variable fails the run.
+file or secret fails the run.
 
 `.github/consumers.json` is an array of `noamsto/<repo>` strings:
 
@@ -137,12 +136,13 @@ A public repo must not name a private repo in a committed file, so list
 private recipients in `CASCADE_CONSUMERS` instead: a JSON array of
 `noamsto/<repo>` strings, e.g. `["noamsto/private-host"]`.
 
-`CASCADE_CONSUMERS` is a repository variable, not a secret: anyone who can
-read the repo's Actions logs can see its value, since GitHub lists step
-`env:` values in the log. It keeps private names out of the git history, not
-out of a public repo's run logs. The workflow itself keeps recipient names
-out of job names and its own log lines: it fans out by matrix index and
-masks each name before use.
+`CASCADE_CONSUMERS` is a secret: repository
+variables are never masked, so a private recipient would show up in public
+run logs, job names and check names. The workflow keeps recipient names out
+of job names and its own log lines: it fans out by matrix index, masks each
+name before use, and outputs only a count and the index range. Validation
+errors name the source and the entry index, never the entry's content. With
+no recipients it logs a warning and still exits green.
 
 Caller snippet:
 
@@ -169,6 +169,7 @@ jobs:
       rev: ${{ github.event.workflow_run.head_sha }}
     secrets:
       CASCADE_APP_PRIVATE_KEY: ${{ secrets.CASCADE_APP_PRIVATE_KEY }}
+      CASCADE_CONSUMERS: ${{ secrets.CASCADE_CONSUMERS }}  # optional
 ```
 
 `secrets: inherit` also works because the secret name matches, but it hands
@@ -195,13 +196,14 @@ workflow triggered by `workflow_run`, `schedule`, `workflow_dispatch` or
       rev: ${{ needs.land.outputs.sha }}
     secrets:
       CASCADE_APP_PRIVATE_KEY: ${{ secrets.CASCADE_APP_PRIVATE_KEY }}
+      CASCADE_CONSUMERS: ${{ secrets.CASCADE_CONSUMERS }}  # optional
 ```
 
 | Input / secret / variable | Default | Meaning |
 | --- | --- | --- |
 | `rev` | none | 40-hex commit on `main` whose CI passed |
 | `CASCADE_APP_PRIVATE_KEY` (secret) | none | App private key |
-| `CASCADE_CONSUMERS` (variable) | none | Private `noamsto/<repo>` recipients |
+| `CASCADE_CONSUMERS` (secret, optional) | none | Private recipients |
 
 ## cascade-bump
 

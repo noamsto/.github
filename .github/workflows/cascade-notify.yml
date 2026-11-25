@@ -1,14 +1,18 @@
 name: Cascade notify
 
 # Sends an `upstream-updated` repository dispatch to every consumer named in the
-# caller's `.github/consumers.json` plus its `CASCADE_CONSUMERS` repository
-# variable, with one App token per recipient so a bad recipient can never read or
-# write any other repo.
+# caller's `.github/consumers.json` plus its `CASCADE_CONSUMERS` secret, with one
+# App token per recipient so a bad recipient can never read or write any other
+# repo.
 #
-# Recipients: `.github/consumers.json` may be absent or empty; `CASCADE_CONSUMERS`
-# is a JSON array of `noamsto/<repo>` strings for private recipients that cannot
-# be named in a committed file. Recipient names are kept out of job names and log
-# lines; only the count is logged.
+# Recipients: the public `.github/consumers.json` file (optional; absent or empty
+# means none) plus the `CASCADE_CONSUMERS` secret. The file's names may appear in
+# logs. The secret is a JSON array of `noamsto/<repo>` strings kept out of git so
+# private recipients never land in a public repo: secret values are masked, the
+# job that computes recipients outputs only a count and the index range (job
+# names are recipient indexes), and each notify job masks its own entry and its
+# bare repo name before any later step reads them. Validation errors name the
+# source and the entry index, never the entry's content.
 #
 # Trust: the caller decides when this runs. When the caller wires it to
 # `workflow_run`, this workflow re-checks that the run succeeded on `main` from a
@@ -16,13 +20,14 @@ name: Cascade notify
 # differs is trusted as the caller's bot landing a new commit. Otherwise it
 # refuses to send. Any other triggering event is trusted to the caller.
 #
-# Permissions: the caller must grant `contents: read` (the recipients job
-# sparse-checks out `.github/consumers.json` at `rev`). The notify job asks for no
-# `GITHUB_TOKEN` permissions of its own; each dispatch uses a per-recipient App
-# token scoped to that one repository with `contents: write` only.
+# Permissions: the caller must grant `contents: read` (both jobs sparse-check out
+# `.github/consumers.json` at `rev`). Each dispatch uses a per-recipient App
+# token scoped to that one repository with `contents: write` only; this workflow
+# asks for `contents: read` and nothing else.
 #
-# Secret: pass `CASCADE_APP_PRIVATE_KEY` and set `vars.CASCADE_APP_ID`. Map the
-# secret explicitly under `secrets:` (recommended), or use `secrets: inherit`.
+# Secrets: pass `CASCADE_APP_PRIVATE_KEY` and `CASCADE_CONSUMERS`, and set
+# `vars.CASCADE_APP_ID`. Map the secrets explicitly under `secrets:`
+# (recommended), or use `secrets: inherit`.
 on:
   workflow_call:
     inputs:
@@ -33,6 +38,9 @@ on:
     secrets:
       CASCADE_APP_PRIVATE_KEY:
         description: Private key for the GitHub App named by CASCADE_APP_ID
+        required: false
+      CASCADE_CONSUMERS:
+        description: JSON array of noamsto/<repo> recipients kept out of git (e.g. private repos)
         required: false
 
 permissions: {}
@@ -47,7 +55,6 @@ jobs:
     permissions:
       contents: read
     outputs:
-      repos: ${{ steps.consumers.outputs.repos }}
       indexes: ${{ steps.consumers.outputs.indexes }}
       count: ${{ steps.consumers.outputs.count }}
     steps:
@@ -95,15 +102,63 @@ jobs:
         id: consumers
         env:
           SEND: ${{ steps.trigger.outputs.send }}
-          CONSUMERS_VAR: ${{ vars.CASCADE_CONSUMERS }}
-        run: |
+          CONSUMERS_SECRET: ${{ secrets.CASCADE_CONSUMERS }}
+        run: &resolve-recipients |
           set -u
 
-          if [ "$SEND" != "true" ]; then
+          # Recipient resolution shared by the `recipients` and `notify` jobs.
+          # Inputs: `.github/consumers.json` in the cwd (optional; absent means
+          # none) and CONSUMERS_SECRET (unset/empty/whitespace means none).
+          # Each source is validated on its own; a failure names the source and
+          # the entry index but never the entry's content. jq's stderr is
+          # suppressed because jq can quote its input.
+          #
+          # INDEX unset/empty: recipients job. Write count and the index range to
+          # GITHUB_OUTPUT; the range carries no names. INDEX set: notify job.
+          # Mask this index's entry and its bare repo name, then write repo=<name>.
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+
+          # validate <source> <json>: set `validated` to the source's bare repo
+          # names as a compact JSON array, or fail with a reason.
+          validated='[]'
+          validate() {
+            local source=$1 json=$2 reason
+            if ! jq -e -s 'length == 1' >/dev/null 2>&1 <<<"$json"; then
+              fail "$source is not valid JSON"
+            fi
+            if ! jq -e -s '.[0] | type == "array"' >/dev/null 2>&1 <<<"$json"; then
+              fail "$source is not a JSON array"
+            fi
+            reason=$(jq -r -s '
+              .[0]
+              | to_entries
+              | map(
+                  . as $entry
+                  | ($entry.value
+                     | if type != "string" then "not a string"
+                       elif (test("^noamsto/[A-Za-z0-9._-]+$")
+                             and (test("^noamsto/[.]+$") | not)) then "ok"
+                       else "not noamsto/<repo>" end) as $reason
+                  | select($reason != "ok")
+                  | "entry \($entry.key): \($reason)"
+                )
+              | .[0] // empty
+            ' <<<"$json" 2>/dev/null)
+            if [ -n "$reason" ]; then
+              fail "$source $reason"
+            fi
+            validated=$(jq -c -s '.[0] | map(ltrimstr("noamsto/"))' <<<"$json" 2>/dev/null)
+          }
+
+          # Recipients job: keep the send=false short-circuit before reading any
+          # input (no file, no secret, no warning).
+          if [ -z "${INDEX:-}" ] && [ "${SEND:-true}" != "true" ]; then
             {
-              echo "repos=[]"
-              echo "indexes=[]"
               echo "count=0"
+              echo "indexes=[]"
             } >> "$GITHUB_OUTPUT"
             echo "nothing to send"
             exit 0
@@ -111,44 +166,50 @@ jobs:
 
           file_repos='[]'
           if [ -f .github/consumers.json ]; then
-            if ! jq -ce '
-              type == "array"
-              and all(.[]; type == "string" and test("^noamsto/[A-Za-z0-9._-]+$") and (test("^noamsto/[.]+$") | not))
-            ' .github/consumers.json > /dev/null; then
-              echo "::error::.github/consumers.json must be an array of noamsto/<repo> strings"
-              exit 1
-            fi
-            file_repos=$(jq -c '[.[] | ltrimstr("noamsto/")]' .github/consumers.json)
+            validate '.github/consumers.json' "$(< .github/consumers.json)"
+            file_repos=$validated
           fi
 
-          consumers_var="${CONSUMERS_VAR:-}"
-          var_repos='[]'
-          if [ -n "${consumers_var//[[:space:]]/}" ]; then
-            if ! jq -ce '
-              type == "array"
-              and all(.[]; type == "string" and test("^noamsto/[A-Za-z0-9._-]+$") and (test("^noamsto/[.]+$") | not))
-            ' <<<"$consumers_var" > /dev/null 2>&1; then
-              echo "::error::CASCADE_CONSUMERS must be a JSON array of noamsto/<repo> strings"
-              exit 1
-            fi
-            var_repos=$(jq -c '[.[] | ltrimstr("noamsto/")]' <<<"$consumers_var")
+          secret_repos='[]'
+          if [ -n "${CONSUMERS_SECRET//[[:space:]]/}" ]; then
+            validate 'CASCADE_CONSUMERS' "$CONSUMERS_SECRET"
+            secret_repos=$validated
           fi
 
-          repos=$(jq -cn --argjson f "$file_repos" --argjson v "$var_repos" '$f + $v | unique')
-          count=$(jq -c 'length' <<<"$repos")
-          indexes=$(jq -c '[range(length)]' <<<"$repos")
-          {
-            echo "repos=$repos"
-            echo "indexes=$indexes"
-            echo "count=$count"
-          } >> "$GITHUB_OUTPUT"
-          echo "notifying $count consumer(s)"
+          repos=$(jq -cn --argjson file "$file_repos" --argjson secret "$secret_repos" \
+            '$file + $secret | unique' 2>/dev/null)
+
+          if [ -z "${INDEX:-}" ]; then
+            count=$(jq -c 'length' <<<"$repos" 2>/dev/null)
+            indexes=$(jq -c '[range(length)]' <<<"$repos" 2>/dev/null)
+            {
+              echo "count=$count"
+              echo "indexes=$indexes"
+            } >> "$GITHUB_OUTPUT"
+            echo "notifying $count consumer(s)"
+            if [ "$count" = "0" ]; then
+              echo "::warning::no recipients configured (no .github/consumers.json entries and no CASCADE_CONSUMERS secret); nothing will be notified"
+            fi
+            exit 0
+          fi
+
+          if [[ ! "$INDEX" =~ ^[0-9]+$ ]]; then
+            fail "INDEX must be a non-negative integer"
+          fi
+          if ! jq -e --argjson index "$INDEX" 'has($index)' >/dev/null 2>&1 <<<"$repos"; then
+            fail "recipient #$INDEX no longer exists (the recipient list changed between jobs)"
+          fi
+          name=$(jq -r --argjson index "$INDEX" '.[$index]' <<<"$repos" 2>/dev/null)
+          echo "::add-mask::noamsto/$name"
+          echo "::add-mask::$name"
+          echo "repo=$name" >> "$GITHUB_OUTPUT"
 
   notify:
     needs: recipients
     if: needs.recipients.outputs.count != '0'
     runs-on: ubuntu-latest
-    permissions: {}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -166,11 +227,20 @@ jobs:
             exit 1
           fi
 
-      - name: Mask recipient
+      - name: Check out consumers file
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.rev }}
+          sparse-checkout: .github/consumers.json
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Resolve recipient
+        id: recipient
         env:
-          RECIPIENT: ${{ fromJSON(needs.recipients.outputs.repos)[matrix.index] }}
-        run: |
-          echo "::add-mask::$RECIPIENT"
+          INDEX: ${{ matrix.index }}
+          CONSUMERS_SECRET: ${{ secrets.CASCADE_CONSUMERS }}
+        run: *resolve-recipients
 
       - name: Mint recipient App token
         id: app-token
@@ -179,13 +249,13 @@ jobs:
           client-id: ${{ vars.CASCADE_APP_ID }}
           private-key: ${{ secrets.CASCADE_APP_PRIVATE_KEY }}
           owner: noamsto
-          repositories: ${{ fromJSON(needs.recipients.outputs.repos)[matrix.index] }}
+          repositories: ${{ steps.recipient.outputs.repo }}
           permission-contents: write
 
       - name: Send upstream-updated
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          RECIPIENT: ${{ fromJSON(needs.recipients.outputs.repos)[matrix.index] }}
+          RECIPIENT: ${{ steps.recipient.outputs.repo }}
           INDEX: ${{ matrix.index }}
           REV: ${{ inputs.rev }}
           DISPATCH_BODY: '{event_type: "upstream-updated", client_payload: {source: $source, rev: $rev}}'
