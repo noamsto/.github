@@ -101,7 +101,14 @@ The workflows use one GitHub App. Grant it Contents read/write, Pull
 requests read/write and Metadata read; nothing else, since bumps only touch
 `flake.lock`. Install the App on every repo in the cascade. In each such
 repo set the `CASCADE_APP_ID` variable (the App ID; the client ID also
-works) and the `CASCADE_APP_PRIVATE_KEY` secret.
+works) and the `CASCADE_APP_PRIVATE_KEY` secret. Sender repos also set the
+`CASCADE_CONSUMERS` variable (see below).
+
+The called workflows read their variables from the calling repository:
+GitHub resolves `vars.CASCADE_APP_ID` and `vars.CASCADE_CONSUMERS` in the
+caller's context, not in noamsto/.github. Set them in each sender and
+receiver repo, or as organization variables; nothing is needed in
+noamsto/.github.
 
 "Allow auto-merge" is not needed: the workflow waits for CI itself. The App
 must not be a bypass actor in the receiver's rulesets. Commits are authored
@@ -114,12 +121,28 @@ Granting the App Workflows write avoids that.
 
 ## cascade-notify
 
-Runs in the sender. It reads `.github/consumers.json`, an array of
-`noamsto/<repo>` strings:
+Runs in the sender. It notifies the union of the recipients in
+`.github/consumers.json` (optional; absent means none) and the caller's
+`CASCADE_CONSUMERS` repository variable, de-duplicated. Every entry must be
+a `noamsto/<repo>` string matching `^noamsto/[A-Za-z0-9._-]+$`; a malformed
+file or variable fails the run.
+
+`.github/consumers.json` is an array of `noamsto/<repo>` strings:
 
 ```json
 ["noamsto/tmux-og"]
 ```
+
+A public repo must not name a private repo in a committed file, so list
+private recipients in `CASCADE_CONSUMERS` instead: a JSON array of
+`noamsto/<repo>` strings, e.g. `["noamsto/private-host"]`.
+
+`CASCADE_CONSUMERS` is a repository variable, not a secret: anyone who can
+read the repo's Actions logs can see its value, since GitHub lists step
+`env:` values in the log. It keeps private names out of the git history, not
+out of a public repo's run logs. The workflow itself keeps recipient names
+out of job names and its own log lines: it fans out by matrix index and
+masks each name before use.
 
 Caller snippet:
 
@@ -152,13 +175,17 @@ jobs:
 every caller secret to the called workflow, so the explicit form is
 preferred.
 
-The workflow re-checks the `workflow_run` conditions and that `rev` is the
-run's head sha. It mints one token per recipient, scoped to that repo; one
-failing recipient does not stop the others.
+The workflow re-checks the `workflow_run` conditions only when `rev` equals
+the triggering run's own head sha: it then requires a successful `push` run
+on `main`. A `rev` that differs is trusted as the caller's bot landing a new
+commit, and the run notes that in the log. It mints one token per recipient,
+scoped to that repo; one failing recipient does not stop the others.
 
 A repo whose landing job merges with `GITHUB_TOKEN` must send its own
 events: those merges start no workflows. Add a job after the landing job,
-`needs:` it, and pass the landed sha from an output:
+`needs:` it, and pass the landed sha from an output. The job may live in a
+workflow triggered by `workflow_run`, `schedule`, `workflow_dispatch` or
+`push`:
 
 ```yaml
   notify:
@@ -170,10 +197,11 @@ events: those merges start no workflows. Add a job after the landing job,
       CASCADE_APP_PRIVATE_KEY: ${{ secrets.CASCADE_APP_PRIVATE_KEY }}
 ```
 
-| Input / secret | Default | Meaning |
+| Input / secret / variable | Default | Meaning |
 | --- | --- | --- |
 | `rev` | none | 40-hex commit on `main` whose CI passed |
 | `CASCADE_APP_PRIVATE_KEY` (secret) | none | App private key |
+| `CASCADE_CONSUMERS` (variable) | none | Private `noamsto/<repo>` recipients |
 
 ## cascade-bump
 
@@ -211,9 +239,10 @@ per input, and a caller-level group would make one input's pending run
 replace another's. The receiver's CI must run on the bot branch's push or on
 `pull_request`; if no check reports within about 10 minutes the run fails.
 
-Unknown sources and malformed payloads are logged and ignored (exit 0). A
-missing or invalid `.github/upstreams.json`, or an entry that is not a
-direct root input of `flake.lock`, fails the run.
+Unknown sources, a source that does not look like `noamsto/<repo>`, and
+malformed payloads are logged and ignored (exit 0). A missing or invalid
+`.github/upstreams.json`, or an entry that is not a direct root input of
+`flake.lock`, fails the run.
 
 ### Merge
 

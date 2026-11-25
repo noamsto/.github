@@ -101,6 +101,11 @@ jobs:
             exit 0
           fi
 
+          if [[ ! "$source" =~ ^noamsto/[A-Za-z0-9._-]+$ ]] || [[ "$source" =~ ^noamsto/[.]+$ ]]; then
+            echo "::notice::ignoring upstream-updated: source is not noamsto/<repo>"
+            exit 0
+          fi
+
           input=''
           if [ -n "$source" ]; then
             input=$(jq -r --arg s "$source" 'if has($s) then .[$s] else empty end' .github/upstreams.json)
