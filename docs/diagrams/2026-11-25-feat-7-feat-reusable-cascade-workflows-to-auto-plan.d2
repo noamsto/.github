@@ -1,0 +1,24 @@
+direction: right
+title: "After: reusable cascade (new pieces dashed green)" {near: top-center; shape: text}
+
+classes: {
+  new: {style: {stroke: "#2da44e"; stroke-dash: 4; stroke-width: 2}}
+}
+
+sender: "Sender repo\n(aeye / prdash / tmux-remux)\nci.yml green on push to main" {shape: rectangle}
+notify: "cascade-notify.yml\nrecipients: consumers.json + CASCADE_CONSUMERS secret -> count\nnotify (i): mask recipient, 1 App token each" {class: new}
+receiver: "Receiver repo (tmux-og ...)\non: repository_dispatch\nupstream-updated" {shape: rectangle}
+validate: "cascade-bump.yml / validate\npayload via env, source in upstreams.json,\nrev 40-hex, root input in flake.lock" {class: new}
+bump: "cascade-bump.yml / bump\nconcurrency per input\nnix flake update, force-push bot/cascade-<input>, PR" {class: new}
+wait: "wait for CI\ncommit statusCheckRollup (GITHUB_TOKEN)\nsettle 60s" {class: new}
+merge: "fresh App token\nmain unchanged? squash --match-head-commit\nelse requeue upstream-updated to self" {class: new}
+readme: ".github/workflows/README.md\nApp setup + caller snippets" {class: new}
+
+sender -> notify: "workflow_run -> uses: @v1 (rev)"
+notify -> receiver: "POST /dispatches {source, rev}"
+receiver -> validate: "uses: @v1"
+validate -> bump: "input (validated)"
+bump -> wait: "sha"
+wait -> merge: "green"
+merge -> sender: "merge push (App) starts receiver CI,\nwhich may notify its own consumers" {style.stroke-dash: 3}
+merge -> receiver: "requeue on moved main" {style.stroke-dash: 3}

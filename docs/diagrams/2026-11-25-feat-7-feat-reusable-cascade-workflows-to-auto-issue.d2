@@ -1,0 +1,16 @@
+direction: right
+title: "Today: every downstream bump is manual" {near: top-center; shape: text}
+
+libs: "aeye / prdash / tmux-remux\nci.yml green on main" {shape: rectangle}
+human: "Owner\n(by hand)" {shape: person}
+tmuxog: "tmux-og\nflake.lock" {shape: rectangle}
+nixcfg: "nix-config\nupdate.yml (02:17 cron)" {shape: rectangle}
+hosts: "private host flake\nhost-update.yml (cron)" {shape: rectangle}
+shared: "noamsto/.github\n.github/workflows/\nauto-assign.yml, dependabot-auto-merge.yml" {shape: rectangle}
+missing: "missing: cascade-notify.yml\n+ cascade-bump.yml" {shape: rectangle; style.stroke-dash: 4; style.stroke: red}
+
+libs -> human: "change lands, nothing notifies"
+human -> tmuxog: "nix flake update <input>, PR, wait CI, merge"
+tmuxog -> nixcfg: "picked up next nightly only"
+nixcfg -> hosts: "picked up next nightly only"
+shared -> missing: "no reusable cascade yet" {style.stroke-dash: 4}

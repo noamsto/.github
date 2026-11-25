@@ -1,0 +1,382 @@
+name: Cascade bump
+
+# Reusable receiver for the cascade protocol. A sender repo runs
+# cascade-notify.yml, which fires an `upstream-updated` dispatch at the calling
+# repo; this workflow maps the sending repo through the calling repo's own
+# `.github/upstreams.json`, bumps the matching flake input on a bot branch,
+# opens a PR, waits for the calling repo's CI on that commit, and merges it.
+#
+# Trust: the dispatch body is untrusted input, chosen by whoever is allowed to
+# send the calling repo that dispatch. It reaches the scripts only through
+# `env:` and is parsed type-strictly with `jq` before any value is used: the
+# `source` repo must be a key of the calling repo's own
+# `.github/upstreams.json` (so only repos that file lists can trigger a bump)
+# and the `rev` must be 40 lowercase hex. Rejected values are logged only
+# through `jq` quoting, never raw.
+#
+# Tokens: an App installation token (Contents + Pull requests write) pushes the
+# bot branch, opens the PR and performs the merge, so the merge push starts the
+# calling repo's push workflows. `GITHUB_TOKEN` is used read-only, only to poll
+# the commit's check rollup. App installation tokens live one hour and
+# create-github-app-token does not refresh them, so the job mints twice: once
+# right before the push/PR, and again right after the CI wait (which uses only
+# `GITHUB_TOKEN`), so the merge always uses a fresh token.
+#
+# Merge rule: wait for the check rollup on the pushed commit, settle, then merge
+# with `--match-head-commit`, so the squashed tree is the tested one. A failing
+# check or twenty polls with no checks at all leaves the PR open for a human.
+# When the default branch moved during the wait, the tested tree is no longer
+# what a merge would land: the run sends the same validated upstream-updated
+# event back to this repository (with the fresh token) and exits, and the
+# per-input concurrency group coalesces the pending rerun. Each requeue needs a
+# commit to have landed during a wait, so retries track real progress; a stuck
+# default branch fails the CI wait loudly instead of looping.
+on:
+  workflow_call:
+    inputs:
+      timeout-minutes:
+        description: Wall-clock ceiling for the bump job, covering the CI wait
+        type: number
+        default: 120
+    secrets:
+      CASCADE_APP_PRIVATE_KEY:
+        description: Private key of the GitHub App named by the CASCADE_APP_ID variable
+        required: false
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      input: ${{ steps.payload.outputs.input }}
+      source: ${{ steps.payload.outputs.source }}
+      rev: ${{ steps.payload.outputs.rev }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: |
+            .github/upstreams.json
+            flake.lock
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Validate payload
+        id: payload
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          set -u
+
+          if [ "$EVENT_NAME" != "repository_dispatch" ] || [ "$ACTION" != "upstream-updated" ]; then
+            echo "::notice::ignoring $EVENT_NAME event; this workflow only handles upstream-updated dispatches"
+            exit 0
+          fi
+
+          if [ ! -f .github/upstreams.json ]; then
+            echo "::error::.github/upstreams.json is missing; add it on the default branch to accept cascades"
+            exit 1
+          fi
+          if ! jq -e 'type == "object" and all(.[]; type == "string")' .github/upstreams.json >/dev/null; then
+            echo "::error::.github/upstreams.json must be a JSON object mapping source repositories to flake input names"
+            exit 1
+          fi
+
+          source=$(jq -r '.source | strings' <<<"$PAYLOAD")
+          rev=$(jq -r '.rev | strings' <<<"$PAYLOAD")
+
+          if [ "$(jq -r '.rev | strings | length' <<<"$PAYLOAD")" != 40 ] || [[ ! "$rev" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::notice::ignoring upstream-updated: rev is not a 40-hex sha"
+            exit 0
+          fi
+
+          if [[ ! "$source" =~ ^noamsto/[A-Za-z0-9._-]+$ ]] || [[ "$source" =~ ^noamsto/[.]+$ ]]; then
+            echo "::notice::ignoring upstream-updated: source is not noamsto/<repo>"
+            exit 0
+          fi
+
+          input=''
+          if [ -n "$source" ]; then
+            input=$(jq -r --arg s "$source" 'if has($s) then .[$s] else empty end' .github/upstreams.json)
+          fi
+          if [ -z "$input" ]; then
+            quoted_source=$(printf '%s' "$source" | jq -Rsr @json)
+            echo "::notice::ignoring upstream-updated: source $quoted_source is not in .github/upstreams.json"
+            exit 0
+          fi
+
+          if [[ ! "$input" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            echo "::error::the source's entry in .github/upstreams.json is not a valid flake input name"
+            exit 1
+          fi
+          if ! jq -e --arg i "$input" '.nodes.root.inputs[$i] | strings' flake.lock >/dev/null; then
+            echo "::error::$input is not a direct root input in flake.lock (missing or follows)"
+            exit 1
+          fi
+
+          quoted_source=$(printf '%s' "$source" | jq -Rsr @json)
+          {
+            echo "input=$input"
+            echo "source=$source"
+            echo "rev=$rev"
+          } >>"$GITHUB_OUTPUT"
+          echo "::notice::accepted upstream-updated: $quoted_source@$rev bumps $input"
+
+  bump:
+    needs: validate
+    if: needs.validate.outputs.input != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    concurrency:
+      group: cascade-bump-${{ needs.validate.outputs.input }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      checks: read
+      statuses: read
+    env:
+      INPUT: ${{ needs.validate.outputs.input }}
+      SOURCE: ${{ needs.validate.outputs.source }}
+      REV: ${{ needs.validate.outputs.rev }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - name: Require App id and key
+        env:
+          APP_ID: ${{ vars.CASCADE_APP_ID }}
+          APP_KEY: ${{ secrets.CASCADE_APP_PRIVATE_KEY }}
+        run: |
+          set -u
+
+          if [ -z "$APP_ID" ] || [ -z "$APP_KEY" ]; then
+            echo "::error::set the CASCADE_APP_ID variable and the CASCADE_APP_PRIVATE_KEY secret"
+            exit 1
+          fi
+
+      - name: Mint push App token
+        id: push-token
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ vars.CASCADE_APP_ID }}
+          private-key: ${{ secrets.CASCADE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+
+      - name: Bump and open PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ steps.push-token.outputs.token }}
+          APP_SLUG: ${{ steps.push-token.outputs.app-slug }}
+        run: |
+          set -u
+
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          git_net() {
+            git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" "$@"
+          }
+
+          uid=$(gh api "/users/${APP_SLUG}%5Bbot%5D" --jq .id)
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${uid}+${APP_SLUG}[bot]@users.noreply.github.com"
+
+          git_net fetch --depth=1 origin "refs/heads/$DEFAULT_BRANCH"
+          git reset --hard FETCH_HEAD
+          base=$(git rev-parse HEAD)
+
+          lock_rev() {
+            jq -r --arg i "$INPUT" '.nodes[.nodes.root.inputs[$i]].locked.rev // "unknown"' flake.lock
+          }
+
+          old=$(lock_rev)
+          nix flake update "$INPUT"
+
+          if git diff --quiet -- flake.lock; then
+            echo "$INPUT already current on $DEFAULT_BRANCH"
+            stale=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "bot/cascade-$INPUT" --base "$DEFAULT_BRANCH" --state open --json number --jq '.[0].number // empty')
+            if [ -n "$stale" ]; then
+              echo "::notice::PR #$stale is now stale; leaving it for a human"
+            fi
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          new=$(lock_rev)
+          git commit -am "chore(deps): update $INPUT" \
+            -m "Bumps $INPUT ${old:0:12} -> ${new:0:12}." \
+            -m "Triggered by $SOURCE@$REV."
+          sha=$(git rev-parse HEAD)
+
+          branch="bot/cascade-$INPUT"
+          if ! git_net push --force "https://github.com/$GITHUB_REPOSITORY.git" "HEAD:refs/heads/$branch"; then
+            echo "::warning::$branch may carry workflow changes the App cannot push; closing it and reopening as a fresh branch"
+            git_net push --delete "https://github.com/$GITHUB_REPOSITORY.git" "$branch" || true
+            if ! git_net push "https://github.com/$GITHUB_REPOSITORY.git" "HEAD:refs/heads/$branch"; then
+              echo "::error::could not push $branch even as a fresh branch"
+              exit 1
+            fi
+          fi
+
+          {
+            printf "Bumps \`%s\` from \`%s\` to \`%s\` in \`flake.lock\`.\n" "$INPUT" "${old:0:12}" "${new:0:12}"
+            printf '\n'
+            printf "Triggered by \`%s@%s\`: https://github.com/%s/commit/%s\n" "$SOURCE" "$REV" "$SOURCE" "$REV"
+            printf '\n'
+            printf '%s\n' "Merges only after this repo's CI is green on the bumped commit."
+          } > "$RUNNER_TEMP/pr-body.md"
+
+          number=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --base "$DEFAULT_BRANCH" --state open --json number --jq '.[0].number // empty')
+          title="chore(deps): update $INPUT"
+          if [ -n "$number" ]; then
+            gh pr edit "$number" --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$RUNNER_TEMP/pr-body.md"
+          else
+            url=$(gh pr create --repo "$GITHUB_REPOSITORY" --base "$DEFAULT_BRANCH" --head "$branch" --title "$title" --body-file "$RUNNER_TEMP/pr-body.md")
+            number=$(gh pr view "$url" --repo "$GITHUB_REPOSITORY" --json number --jq .number)
+          fi
+          if [ -z "$number" ]; then
+            echo "::error::could not determine the number of the bot PR on $branch"
+            exit 1
+          fi
+
+          {
+            echo "changed=true"
+            echo "sha=$sha"
+            echo "base=$base"
+            echo "number=$number"
+          } >> "$GITHUB_OUTPUT"
+          echo "opened or updated PR #$number on $branch (commit $sha, base $base)"
+
+      - name: Wait for CI
+        id: ci
+        if: steps.pr.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.pr.outputs.sha }}
+          PR: ${{ steps.pr.outputs.number }}
+          POLL_SECONDS: '30'
+          SETTLE_SECONDS: '60'
+        run: |
+          set -u
+
+          query_rollup() {
+            gh api graphql \
+              -f query="query(\$owner:String!,\$name:String!,\$oid:GitObjectID!){repository(owner:\$owner,name:\$name){object(oid:\$oid){... on Commit{statusCheckRollup{state contexts{totalCount}}}}}}" \
+              -f owner="${GITHUB_REPOSITORY%/*}" \
+              -f name="${GITHUB_REPOSITORY#*/}" \
+              -f oid="$SHA" \
+              --jq '.data.repository.object.statusCheckRollup | if . == null then "NONE 0" else "\(.state) \(.contexts.totalCount)" end'
+          }
+
+          errors=0
+          none=0
+          while :; do
+            if ! out=$(query_rollup); then
+              errors=$((errors + 1))
+              echo "::warning::check rollup query failed ($errors consecutive); retrying in ${POLL_SECONDS:-30}s"
+              if [ "$errors" -ge 10 ]; then
+                echo "::error::gave up after 10 consecutive check rollup query failures on $SHA; refusing to merge (PR #$PR left open)"
+                exit 1
+              fi
+              sleep "${POLL_SECONDS:-30}"
+              continue
+            fi
+            errors=0
+            state=${out%% *}
+            count=${out#* }
+            case "$state" in
+              NONE)
+                none=$((none + 1))
+                if [ "$none" -ge 20 ]; then
+                  echo "::error::no CI reported on $SHA; refusing to merge (PR #$PR left open)"
+                  exit 1
+                fi
+                ;;
+              PENDING|EXPECTED)
+                none=0
+                ;;
+              FAILURE|ERROR)
+                echo "::error::CI failed on $SHA (PR #$PR left open)"
+                exit 1
+                ;;
+              SUCCESS)
+                none=0
+                sleep "${SETTLE_SECONDS:-60}"
+                if out=$(query_rollup); then
+                  errors=0
+                  settled_state=${out%% *}
+                  settled_count=${out#* }
+                  if [ "$settled_state" = SUCCESS ] && [ "$settled_count" = "$count" ]; then
+                    echo "::notice::CI is green on $SHA ($count checks); merging"
+                    exit 0
+                  fi
+                else
+                  errors=$((errors + 1))
+                  echo "::warning::check rollup query failed after the settle ($errors consecutive)"
+                  if [ "$errors" -ge 10 ]; then
+                    echo "::error::gave up after 10 consecutive check rollup query failures on $SHA; refusing to merge (PR #$PR left open)"
+                    exit 1
+                  fi
+                fi
+                ;;
+              *)
+                echo "::warning::unexpected check rollup state '$state'; retrying"
+                none=0
+                ;;
+            esac
+            sleep "${POLL_SECONDS:-30}"
+          done
+
+      - name: Mint merge App token
+        id: merge-token
+        if: steps.pr.outputs.changed == 'true'
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ vars.CASCADE_APP_ID }}
+          private-key: ${{ secrets.CASCADE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Merge or requeue
+        id: merge
+        if: steps.pr.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.merge-token.outputs.token }}
+          SHA: ${{ steps.pr.outputs.sha }}
+          BASE: ${{ steps.pr.outputs.base }}
+          PR: ${{ steps.pr.outputs.number }}
+          DISPATCH_BODY: '{event_type: "upstream-updated", client_payload: {source: $source, rev: $rev}}'
+        run: |
+          set -u
+
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          head=$(git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" ls-remote origin "refs/heads/$DEFAULT_BRANCH" | cut -f1)
+
+          if [ "$head" != "$BASE" ]; then
+            echo "::notice::$DEFAULT_BRANCH moved during CI; requeueing"
+            jq -n --arg source "$SOURCE" --arg rev "$REV" "$DISPATCH_BODY" \
+              | gh api --method POST "repos/$GITHUB_REPOSITORY/dispatches" --input -
+            exit 0
+          fi
+
+          gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --squash --match-head-commit "$SHA" --subject "chore(deps): update $INPUT (#$PR)"
+          echo "merged PR #$PR (squash, commit $SHA) on $DEFAULT_BRANCH"
