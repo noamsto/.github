@@ -1,0 +1,71 @@
+name: Dependabot auto-merge
+
+# Queues auto-merge, so GitHub merges the moment required checks pass and a red
+# build just leaves the PR sitting.
+#
+# No permissions: block on purpose. The job inherits the caller's: write/write
+# for GITHUB_TOKEN callers, read/read for App-token callers (the merge uses the
+# App). A fixed ceiling would break one of the two, and a caller that declares
+# none gets the repo default token.
+#
+# The App token requests only contents and pull-requests. github-actions bumps
+# edit workflow files, which an App can merge only if it holds `workflows`.
+on:
+  workflow_call:
+    inputs:
+      exempt-ecosystems:
+        description: Comma-separated dependabot ecosystems (no spaces) whose major bumps still auto-merge
+        type: string
+        default: nix
+      app-client-id:
+        description: GitHub App client ID; when set, the merge uses an App token so the push triggers downstream workflows
+        type: string
+        default: ''
+    secrets:
+      # `secrets: inherit` cannot carry this: the caller must map it explicitly.
+      app-private-key:
+        description: Private key for the GitHub App named by app-client-id
+        required: false
+
+jobs:
+  auto-merge:
+    if: >-
+      (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
+      && github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require client id with private key
+        env:
+          APP_KEY: ${{ secrets.app-private-key }}
+          APP_CLIENT_ID: ${{ inputs.app-client-id }}
+        run: |
+          if [ -n "$APP_KEY" ] && [ -z "$APP_CLIENT_ID" ]; then
+            echo "::error::app-private-key was passed but app-client-id is empty"
+            exit 1
+          fi
+
+      - uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        id: metadata
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        id: app-token
+        if: inputs.app-client-id != ''
+        with:
+          client-id: ${{ inputs.app-client-id }}
+          private-key: ${{ secrets.app-private-key }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Enable auto-merge
+        # A nix flake input is a commit pin with no version to read, so its
+        # update-type is unreliable; exempt ecosystems stay eligible for majors.
+        if: >-
+          steps.metadata.outputs.update-type != 'version-update:semver-major'
+          || (steps.metadata.outputs.package-ecosystem != ''
+          && contains(format(',{0},', inputs.exempt-ecosystems), format(',{0},', steps.metadata.outputs.package-ecosystem)))
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
