@@ -1,0 +1,286 @@
+name: Dependabot vendor hash
+
+# Dependabot updates go.mod/go.sum but cannot know the vendorHash the Nix
+# expression pins, so every Go bump it opens fails the `nix` check until that
+# hash is corrected. This pushes the correction onto the PR branch.
+#
+# Callers own the trigger and `permissions: contents: read`. Run it on
+# `pull_request_target`: Dependabot-triggered `pull_request` events cannot read
+# Actions secrets (the App key and client id are Actions secrets/variables, not
+# Dependabot ones). Nothing here checks out or runs code from the PR's *base*;
+# the PR head is untrusted and is only ever built in the `build` job.
+#
+# Trust split. `build` compiles and tests the bumped dependency's code, so it
+# gets a read-only token and no secret, and it blanks the nix action's own
+# token. It hands over a diff of `*.nix` files, nothing else. `push` is the only
+# job that sees the App key; it never runs nix or any file from the PR. It
+# validates the diff as untrusted data before minting a token: only in-place
+# edits of tracked `*.nix` files, and after replacing every SRI hash with a
+# fixed token the patched files must equal the originals, so the diff can change
+# hash strings only, never the build definition. Residual risk: that check
+# cannot tell a vendor hash from another fixed-output hash, so a tainted build
+# could still swap any SRI hash for one it controls. The token is scoped to
+# `contents: write` on the calling repo only, and the push is non-force.
+#
+# No cache is read or written: pull_request_target caches belong to the default
+# branch, and a tainted runner must not be able to poison them.
+#
+# The App's own push re-triggers the caller, which then finds the hashes right
+# and ends with nothing to push. Callers must not declare a `concurrency` group
+# named `vendor-hash-<pr>` or `vendor-hash-push-<pr>`: it would deadlock.
+on:
+  workflow_call:
+    inputs:
+      build-attr:
+        description: Flake attribute to build; the build must fail on a stale hash
+        type: string
+        default: .#default
+      app-client-id:
+        description: Client ID of the GitHub App that pushes; defaults to the caller's VENDOR_HASH_APP_CLIENT_ID variable
+        type: string
+        default: ''
+    secrets:
+      # `secrets: inherit` also carries this, since the name matches.
+      VENDOR_HASH_APP_PRIVATE_KEY:
+        description: Private key of the GitHub App named by app-client-id
+        required: false
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    if: >-
+      (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
+      && github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # A newer push to the PR supersedes this run. The push job is protected on
+    # its own (head sha check, non-force push), so cancelling here is safe.
+    concurrency:
+      group: vendor-hash-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    outputs:
+      changed: ${{ steps.fix.outputs.changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      # The action defaults to writing the job token into nix.conf as an access
+      # token; blank it so the build below cannot read one.
+      - uses: DeterminateSystems/determinate-nix-action@4b040423529d49b1a19ba918742e0aa9aa95031a # v3.24.3
+        with:
+          github-token: ''
+
+      # `fix hashes` only rewrites mismatches the daemon recorded from a failed
+      # build, so the build has to run first. A stale hash fails it; that is
+      # expected, so its status is kept instead of ignored. A failed build
+      # that fix hashes cannot explain is not a hash problem and fails the job.
+      - name: Build and fix hashes
+        id: fix
+        env:
+          BUILD_ATTR: ${{ inputs.build-attr }}
+        run: |
+          set -u
+
+          if nix build "$BUILD_ATTR" --no-link --keep-going; then
+            built=true
+          else
+            built=false
+          fi
+
+          determinate-nixd fix hashes --auto-apply
+
+          # Tracked files only: `fix hashes` rewrites existing files, so an
+          # untracked or non-.nix file is never part of the hand-off.
+          git diff --no-ext-diff --no-textconv -- '*.nix' > "$RUNNER_TEMP/vendor-hash.patch"
+
+          if [ -s "$RUNNER_TEMP/vendor-hash.patch" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+          if [ "$built" = false ]; then
+            echo "::error::the build of $BUILD_ATTR failed and fix hashes changed nothing, so this is not a stale hash"
+            exit 1
+          fi
+          echo "::notice::hashes already correct"
+
+      - name: Upload patch
+        if: steps.fix.outputs.changed == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vendor-hash-patch
+          path: ${{ runner.temp }}/vendor-hash.patch
+          if-no-files-found: error
+          retention-days: 1
+
+  push:
+    needs: build
+    if: >-
+      needs.build.outputs.changed == 'true'
+      && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
+      && github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: vendor-hash-push-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    env:
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      # Fresh checkout of the branch the patch will land on. Nothing from it is
+      # ever executed: this job runs no nix and no repository script.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          persist-credentials: false
+
+      - name: Check the branch has not moved
+        id: head
+        run: |
+          set -u
+
+          if [ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]; then
+            echo "::notice::$HEAD_REF moved since this run started; the run for the newer commit handles it"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Download patch
+        if: steps.head.outputs.proceed == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vendor-hash-patch
+          path: ${{ runner.temp }}/patch
+
+      # The patch came from a runner that executed dependency code: treat it as
+      # untrusted data, and do it before any token exists.
+      - name: Validate and apply patch
+        if: steps.head.outputs.proceed == 'true'
+        env:
+          GIT_CONFIG_NOSYSTEM: '1'
+        run: |
+          set -u
+
+          fail() {
+            echo "::error::rejected patch: $1"
+            exit 1
+          }
+
+          patch="$RUNNER_TEMP/patch/vendor-hash.patch"
+          paths="$RUNNER_TEMP/validated-paths"
+
+          [ -f "$patch" ] || fail "no patch file in the artifact"
+          size=$(wc -c < "$patch")
+          if [ "$size" -eq 0 ] || [ "$size" -gt 1048576 ]; then
+            fail "size $size bytes is outside 1..1048576"
+          fi
+
+          # --summary only prints creates, deletes, renames, copies and mode
+          # changes, none of which a hash fix needs.
+          if [ -n "$(git apply --summary "$patch")" ]; then
+            fail "it creates, deletes, renames or changes the mode of a file"
+          fi
+
+          # Records are `added<TAB>deleted<TAB>path`, NUL-terminated.
+          : > "$paths"
+          while IFS= read -r -d '' record; do
+            added=${record%%$'\t'*}
+            rest=${record#*$'\t'}
+            deleted=${rest%%$'\t'*}
+            path=${rest#*$'\t'}
+            if [[ ! "$added" =~ ^[0-9]+$ ]] || [[ ! "$deleted" =~ ^[0-9]+$ ]]; then
+              fail "a binary or unparsable change"
+            fi
+            case "$path" in
+              *.nix) ;;
+              *) fail "it touches a path that is not a .nix file" ;;
+            esac
+            case "/$path/" in
+              */.git/* | */../* | //*) fail "it touches an unsafe path" ;;
+            esac
+            mode=$(git ls-files -s -- "$path" | cut -d' ' -f1)
+            if [ "$mode" != 100644 ] && [ "$mode" != 100755 ]; then
+              fail "it touches a path that is not a tracked regular file"
+            fi
+            printf '%s\0' "$path" >> "$paths"
+          done < <(git apply --numstat -z "$patch")
+
+          [ -s "$paths" ] || fail "it changes no file"
+
+          git apply --check "$patch"
+          git apply "$patch"
+
+          # A hash fix changes hash strings and nothing else: with every SRI
+          # hash replaced by a fixed token, each file must equal its original.
+          normalize() {
+            sed -E 's/sha256-[A-Za-z0-9+\/]{43}=/HASH/g; s/sha512-[A-Za-z0-9+\/]{86}==/HASH/g'
+          }
+          while IFS= read -r -d '' path; do
+            if ! diff <(git show "HEAD:$path" | normalize) <(normalize < "$path") > /dev/null; then
+              fail "it changes more than hash strings in a .nix file"
+            fi
+          done < "$paths"
+
+          echo "::notice::patch changes only hashes in $(tr -cd '\0' < "$paths" | wc -c) file(s)"
+
+      - name: Require App client id and key
+        if: steps.head.outputs.proceed == 'true'
+        env:
+          APP_CLIENT_ID: ${{ inputs.app-client-id || vars.VENDOR_HASH_APP_CLIENT_ID }}
+          APP_KEY: ${{ secrets.VENDOR_HASH_APP_PRIVATE_KEY }}
+        run: |
+          set -u
+
+          if [ -z "$APP_CLIENT_ID" ] || [ -z "$APP_KEY" ]; then
+            echo "::error::set the VENDOR_HASH_APP_CLIENT_ID variable (or the app-client-id input) and the VENDOR_HASH_APP_PRIVATE_KEY secret"
+            exit 1
+          fi
+
+      # contents: write is all a push needs; the App may hold more, the token
+      # does not.
+      - name: Mint push App token
+        id: app-token
+        if: steps.head.outputs.proceed == 'true'
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ inputs.app-client-id || vars.VENDOR_HASH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.VENDOR_HASH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+
+      # An App token push re-triggers CI, so the stale `nix` failure clears
+      # itself; a GITHUB_TOKEN push would leave the check pending forever. The
+      # push is non-force and only adds the validated paths.
+      - name: Commit and push
+        if: steps.head.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          set -u
+
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+
+          uid=$(gh api "/users/${APP_SLUG}%5Bbot%5D" --jq .id)
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${uid}+${APP_SLUG}[bot]@users.noreply.github.com"
+
+          xargs -0 git add -- < "$RUNNER_TEMP/validated-paths"
+          git commit -m "build(deps): fix Nix hashes"
+
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" \
+            push "https://github.com/$GITHUB_REPOSITORY.git" "HEAD:refs/heads/$HEAD_REF"
