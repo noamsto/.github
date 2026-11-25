@@ -1,0 +1,163 @@
+name: Cascade notify
+
+# Sends an `upstream-updated` repository dispatch to every consumer listed in
+# `.github/consumers.json`, with one App token per recipient so a bad recipient
+# can never read or write any other repo.
+#
+# Trust: the caller decides when this runs. When the caller wires it to
+# `workflow_run`, this workflow re-checks that the run succeeded on `main` from a
+# `push` and that its head sha equals the `rev` input, and otherwise refuses to
+# send. Any other triggering event is trusted to the caller.
+#
+# Permissions: the caller must grant `contents: read` (the recipients job
+# sparse-checks out `.github/consumers.json` at `rev`). The notify job asks for no
+# `GITHUB_TOKEN` permissions of its own; each dispatch uses a per-recipient App
+# token scoped to that one repository with `contents: write` only.
+#
+# Secret: pass `CASCADE_APP_PRIVATE_KEY` and set `vars.CASCADE_APP_ID`. Map the
+# secret explicitly under `secrets:` (recommended), or use `secrets: inherit`.
+on:
+  workflow_call:
+    inputs:
+      rev:
+        description: 40-hex commit on main whose CI passed
+        type: string
+        required: true
+    secrets:
+      CASCADE_APP_PRIVATE_KEY:
+        description: Private key for the GitHub App named by CASCADE_APP_ID
+        required: false
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  recipients:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      repos: ${{ steps.consumers.outputs.repos }}
+      count: ${{ steps.consumers.outputs.count }}
+    steps:
+      - name: Check trigger
+        id: trigger
+        env:
+          REV: ${{ inputs.rev }}
+          EVENT_NAME: ${{ github.event_name }}
+          WR_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          WR_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WR_EVENT: ${{ github.event.workflow_run.event }}
+          WR_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -u
+
+          if [[ ! "$REV" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::rev must be a 40-hex commit sha"
+            exit 1
+          fi
+
+          send=true
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            if [ "$WR_CONCLUSION" != "success" ] \
+              || [ "$WR_BRANCH" != "main" ] \
+              || [ "$WR_EVENT" != "push" ]; then
+              echo "::notice::ignoring workflow_run ($WR_BRANCH/$WR_EVENT/$WR_CONCLUSION): not a green push to main"
+              send=false
+            elif [ "$WR_SHA" != "$REV" ]; then
+              echo "::error::rev does not match workflow_run.head_sha"
+              exit 1
+            fi
+          fi
+
+          echo "send=$send" >> "$GITHUB_OUTPUT"
+
+      - name: Check out consumers file
+        if: steps.trigger.outputs.send == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.rev }}
+          sparse-checkout: .github/consumers.json
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Read consumers
+        id: consumers
+        env:
+          SEND: ${{ steps.trigger.outputs.send }}
+        run: |
+          set -u
+
+          if [ "$SEND" != "true" ]; then
+            echo "repos=[]" >> "$GITHUB_OUTPUT"
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            echo "nothing to send"
+            exit 0
+          fi
+
+          if [ ! -f .github/consumers.json ]; then
+            echo "::error::.github/consumers.json is missing"
+            exit 1
+          fi
+
+          if ! jq -ce '
+            type == "array"
+            and all(.[]; type == "string" and test("^noamsto/[A-Za-z0-9._-]+$") and (test("^noamsto/[.]+$") | not))
+          ' .github/consumers.json > /dev/null; then
+            echo "::error::.github/consumers.json must be an array of noamsto/<repo> strings"
+            exit 1
+          fi
+
+          repos=$(jq -c '[.[] | ltrimstr("noamsto/")] | unique' .github/consumers.json)
+          count=$(jq -c 'length' <<<"$repos")
+          echo "repos=$repos" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "consumers: $repos"
+
+  notify:
+    needs: recipients
+    if: needs.recipients.outputs.count != '0'
+    runs-on: ubuntu-latest
+    permissions: {}
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: ${{ fromJSON(needs.recipients.outputs.repos) }}
+    steps:
+      - name: Require App id and key
+        env:
+          APP_ID: ${{ vars.CASCADE_APP_ID }}
+          APP_KEY: ${{ secrets.CASCADE_APP_PRIVATE_KEY }}
+        run: |
+          set -u
+
+          if [ -z "$APP_ID" ] || [ -z "$APP_KEY" ]; then
+            echo "::error::set the CASCADE_APP_ID variable and the CASCADE_APP_PRIVATE_KEY secret"
+            exit 1
+          fi
+
+      - name: Mint recipient App token
+        id: app-token
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ vars.CASCADE_APP_ID }}
+          private-key: ${{ secrets.CASCADE_APP_PRIVATE_KEY }}
+          owner: noamsto
+          repositories: ${{ matrix.repo }}
+          permission-contents: write
+
+      - name: Send upstream-updated
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RECIPIENT: ${{ matrix.repo }}
+          REV: ${{ inputs.rev }}
+          DISPATCH_BODY: '{event_type: "upstream-updated", client_payload: {source: $source, rev: $rev}}'
+        run: |
+          set -u
+
+          jq -n --arg source "$GITHUB_REPOSITORY" --arg rev "$REV" "$DISPATCH_BODY" \
+            | gh api --method POST "repos/noamsto/$RECIPIENT/dispatches" --input -
+          echo "sent upstream-updated to noamsto/$RECIPIENT (rev $REV)"
