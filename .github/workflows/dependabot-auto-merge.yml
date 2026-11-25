@@ -1,13 +1,13 @@
 name: Dependabot auto-merge
 
-# A dependency bump with green CI has nothing left for a human to decide.
-# Auto-merge queues the PR and GitHub merges it the moment the required checks
-# pass, so a red build simply leaves it sitting instead of needing a sweep.
-# The caller owns the trigger and permissions; the job inherits them, so a
-# caller without a permissions: block gets the repo default token. A fixed
-# ceiling here would break either token callers (write) or App callers (read). With
-# GITHUB_TOKEN grant contents: write and pull-requests: write; with an App
-# token, contents: read and pull-requests: read suffice, as the merge uses the App.
+# Queues auto-merge, so GitHub merges the moment required checks pass and a red
+# build just leaves the PR sitting.
+#
+# No permissions: block on purpose. The job inherits the caller's: write/write
+# for GITHUB_TOKEN callers, read/read for App-token callers (the merge uses the
+# App). A fixed ceiling would break one of the two, and a caller that declares
+# none gets the repo default token.
+#
 # The App token requests only contents and pull-requests. github-actions bumps
 # edit workflow files, which an App can merge only if it holds `workflows`.
 on:
