@@ -3,8 +3,11 @@ name: Dependabot auto-merge
 # A dependency bump with green CI has nothing left for a human to decide.
 # Auto-merge queues the PR and GitHub merges it the moment the required checks
 # pass, so a red build simply leaves it sitting instead of needing a sweep.
-# The caller owns the trigger and must grant contents: write and
-# pull-requests: write, since a called workflow cannot exceed the caller's token.
+# The caller owns the trigger and permissions; the job inherits them. With
+# GITHUB_TOKEN grant contents: write and pull-requests: write; with an App
+# token, contents: read and pull-requests: read suffice, as the merge uses the App.
+# The App token requests only contents and pull-requests. github-actions bumps
+# edit workflow files, which an App can merge only if it holds `workflows`.
 on:
   workflow_call:
     inputs:
@@ -22,18 +25,23 @@ on:
         description: Private key for the GitHub App named by app-client-id
         required: false
 
-permissions: {}
-
 jobs:
   auto-merge:
     if: >-
       (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
       && github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
     steps:
+      - name: Require client id with private key
+        env:
+          APP_KEY: ${{ secrets.app-private-key }}
+          APP_CLIENT_ID: ${{ inputs.app-client-id }}
+        run: |
+          if [ -n "$APP_KEY" ] && [ -z "$APP_CLIENT_ID" ]; then
+            echo "::error::app-private-key was passed but app-client-id is empty"
+            exit 1
+          fi
+
       - uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
         id: metadata
         with:

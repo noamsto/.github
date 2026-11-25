@@ -27,9 +27,16 @@ jobs:
 ## dependabot-auto-merge
 
 Enables squash auto-merge on Dependabot PRs, except semver-major bumps outside
-`exempt-ecosystems`. Callers need `contents: write` and `pull-requests: write`
-even with `pull_request_target`. Repos that never want nix majors merged
-(tmux-og, aeye) pass `exempt-ecosystems: ''`.
+`exempt-ecosystems`. Pass `exempt-ecosystems: ''` to opt out of the default
+`nix` exemption. Any PR whose update type Dependabot reports as empty still
+auto-merges.
+
+The job inherits the caller's permissions: grant `contents: write` and
+`pull-requests: write` with `GITHUB_TOKEN`, but only `contents: read` and
+`pull-requests: read` with an App token, since the merge uses the App.
+The App token requests only contents and pull-requests. github-actions bumps
+edit workflow files, which an App can merge only if it holds `workflows`
+permission; confirm that before relying on this for them.
 
 With `GITHUB_TOKEN`:
 
@@ -57,8 +64,8 @@ name: Dependabot auto-merge
 on: pull_request_target
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
+  pull-requests: read
 
 jobs:
   auto-merge:
