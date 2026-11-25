@@ -3,7 +3,9 @@ name: Dependabot auto-merge
 # A dependency bump with green CI has nothing left for a human to decide.
 # Auto-merge queues the PR and GitHub merges it the moment the required checks
 # pass, so a red build simply leaves it sitting instead of needing a sweep.
-# The caller owns the trigger and permissions; the job inherits them. With
+# The caller owns the trigger and permissions; the job inherits them, so a
+# caller without a permissions: block gets the repo default token. A fixed
+# ceiling here would break either token callers (write) or App callers (read). With
 # GITHUB_TOKEN grant contents: write and pull-requests: write; with an App
 # token, contents: read and pull-requests: read suffice, as the merge uses the App.
 # The App token requests only contents and pull-requests. github-actions bumps

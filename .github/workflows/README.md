@@ -31,7 +31,9 @@ Enables squash auto-merge on Dependabot PRs, except semver-major bumps outside
 `nix` exemption. Any PR whose update type Dependabot reports as empty still
 auto-merges.
 
-The job inherits the caller's permissions: grant `contents: write` and
+This workflow sets no token ceiling of its own, so the caller must always
+declare `permissions:`; without it the job runs with the repository's default
+token. The job inherits the caller's permissions: grant `contents: write` and
 `pull-requests: write` with `GITHUB_TOKEN`, but only `contents: read` and
 `pull-requests: read` with an App token, since the merge uses the App.
 The App token requests only contents and pull-requests. github-actions bumps
