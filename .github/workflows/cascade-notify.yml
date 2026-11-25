@@ -115,6 +115,7 @@ jobs:
           #
           # INDEX unset/empty: recipients job. Write count and the index range to
           # GITHUB_OUTPUT; the range carries no names. INDEX set: notify job.
+          # Mode B also requires the recomputed count to equal the published count.
           # Mask this index's entry and its bare repo name, then write repo=<name>.
           fail() {
             echo "::error::$1"
@@ -196,6 +197,10 @@ jobs:
           if [[ ! "$INDEX" =~ ^[0-9]+$ ]]; then
             fail "INDEX must be a non-negative integer"
           fi
+          now=$(jq -c 'length' <<<"$repos" 2>/dev/null)
+          if [ "$now" != "${COUNT:-}" ]; then
+            fail "the recipient list changed between jobs (count ${COUNT:-unset}, now $now)"
+          fi
           if ! jq -e --argjson index "$INDEX" 'has($index)' >/dev/null 2>&1 <<<"$repos"; then
             fail "recipient #$INDEX no longer exists (the recipient list changed between jobs)"
           fi
@@ -239,6 +244,7 @@ jobs:
         id: recipient
         env:
           INDEX: ${{ matrix.index }}
+          COUNT: ${{ needs.recipients.outputs.count }}
           CONSUMERS_SECRET: ${{ secrets.CASCADE_CONSUMERS }}
         run: *resolve-recipients
 
