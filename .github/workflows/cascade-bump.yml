@@ -31,8 +31,6 @@ name: Cascade bump
 # per-input concurrency group coalesces the pending rerun. Each requeue needs a
 # commit to have landed during a wait, so retries track real progress; a stuck
 # default branch fails the CI wait loudly instead of looping.
-#
-# Workflow-level permissions are empty; each job grants exactly what it needs.
 on:
   workflow_call:
     inputs:

@@ -109,9 +109,8 @@ GitHub resolves `vars.CASCADE_APP_ID` in the caller's context, not in
 noamsto/.github. Set it in each sender and receiver repo, or as an
 organization variable; nothing is needed in noamsto/.github.
 
-"Allow auto-merge" is not needed: the workflow waits for CI itself. The App
-must not be a bypass actor in the receiver's rulesets. Commits are authored
-as the App's bot user.
+"Allow auto-merge" is not needed. The App must not be a bypass actor in the
+receiver's rulesets. Commits are authored as the App's bot user.
 
 The App has no Workflows permission. If GitHub refuses the bot branch's
 force-push because the update spans workflow-file changes, the run deletes
@@ -136,13 +135,10 @@ A public repo must not name a private repo in a committed file, so list
 private recipients in `CASCADE_CONSUMERS` instead: a JSON array of
 `noamsto/<repo>` strings, e.g. `["noamsto/private-host"]`.
 
-`CASCADE_CONSUMERS` is a secret: repository
-variables are never masked, so a private recipient would show up in public
-run logs, job names and check names. The workflow keeps recipient names out
-of job names and its own log lines: it fans out by matrix index, masks each
-name before use, and outputs only a count and the index range. Validation
-errors name the source and the entry index, never the entry's content. With
-no recipients it logs a warning and still exits green.
+`CASCADE_CONSUMERS` is a secret: repository variables are never masked, so a
+private recipient would show up in public run logs, job names and check
+names. The workflow masks each recipient name before it is used, and with no
+recipients it logs a warning and still exits green.
 
 Caller snippet:
 
@@ -176,11 +172,10 @@ jobs:
 every caller secret to the called workflow, so the explicit form is
 preferred.
 
-The workflow re-checks the `workflow_run` conditions only when `rev` equals
-the triggering run's own head sha: it then requires a successful `push` run
-on `main`. A `rev` that differs is trusted as the caller's bot landing a new
-commit, and the run notes that in the log. It mints one token per recipient,
-scoped to that repo; one failing recipient does not stop the others.
+When `rev` is the triggering `workflow_run`'s head sha, the workflow requires
+that run to be a successful `push` on `main`; a different `rev` is trusted as
+a bot landing. It mints one token per recipient, scoped to that repo; one
+failing recipient does not stop the others.
 
 A repo whose landing job merges with `GITHUB_TOKEN` must send its own
 events: those merges start no workflows. Add a job after the landing job,

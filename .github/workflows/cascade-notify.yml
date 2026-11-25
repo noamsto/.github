@@ -109,14 +109,7 @@ jobs:
           # Recipient resolution shared by the `recipients` and `notify` jobs.
           # Inputs: `.github/consumers.json` in the cwd (optional; absent means
           # none) and CONSUMERS_SECRET (unset/empty/whitespace means none).
-          # Each source is validated on its own; a failure names the source and
-          # the entry index but never the entry's content. jq's stderr is
-          # suppressed because jq can quote its input.
-          #
-          # INDEX unset/empty: recipients job. Write count and the index range to
-          # GITHUB_OUTPUT; the range carries no names. INDEX set: notify job.
-          # Mode B also requires the recomputed count to equal the published count.
-          # Mask this index's entry and its bare repo name, then write repo=<name>.
+          # jq's stderr is suppressed because jq can quote its input.
           fail() {
             echo "::error::$1"
             exit 1
