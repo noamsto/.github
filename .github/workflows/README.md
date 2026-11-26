@@ -84,6 +84,78 @@ jobs:
 | `app-client-id` | empty | App client ID; set to merge with an App token |
 | `app-private-key` (secret) | none | App private key; required when `app-client-id` is set |
 
+## dependabot-vendor-hash
+
+Dependabot bumps `go.mod`/`go.sum` but cannot know the `vendorHash` a Nix
+expression pins, so each Go bump fails the `nix` check until the hash is
+fixed. This workflow builds the PR, lets `determinate-nixd fix hashes` correct
+the hashes and pushes the corrected `*.nix` files onto the Dependabot branch.
+The App push re-triggers CI; the rerun finds the hashes right and does nothing.
+
+Run it on `pull_request_target`: Dependabot-triggered `pull_request` events
+cannot read Actions secrets. The caller owns the trigger and must grant
+`contents: read`, since a called workflow cannot exceed the caller's token.
+
+```yaml
+name: Dependabot vendor hash
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    paths:
+      - go.mod
+      - go.sum
+
+permissions:
+  contents: read
+
+jobs:
+  vendor-hash:
+    uses: noamsto/.github/.github/workflows/dependabot-vendor-hash.yml@v1
+    secrets:
+      VENDOR_HASH_APP_PRIVATE_KEY: ${{ secrets.VENDOR_HASH_APP_PRIVATE_KEY }}
+```
+
+Unlike `dependabot-auto-merge`, the secret here is named like the caller's, so
+`secrets: inherit` also works. The explicit form is preferred: inherit hands
+every caller secret to the called workflow (only the `push` job references
+one), and only the explicit form can map a differently named secret. Add no
+`concurrency` named `vendor-hash-<pr number>` or `vendor-hash-push-<pr
+number>`: the workflow uses those groups itself.
+
+| Input / secret | Default | Meaning |
+| --- | --- | --- |
+| `build-attr` | `.#default` | Flake attribute to build; it must fail on a stale hash |
+| `app-client-id` | `vars.VENDOR_HASH_APP_CLIENT_ID` | App client ID, read from the caller's variables when empty |
+| `VENDOR_HASH_APP_PRIVATE_KEY` (secret) | none | App private key; required when a hash needs pushing |
+
+App setup: install a GitHub App with Contents read/write on the repo, then
+set the client ID as the `VENDOR_HASH_APP_CLIENT_ID` Actions variable and the
+private key as the `VENDOR_HASH_APP_PRIVATE_KEY` Actions secret. They must be
+Actions secrets and variables, not Dependabot ones, because
+`pull_request_target` reads the Actions set. A missing key fails the `push`
+job, and so only when a hash actually changed.
+
+Trust split. The PR is untrusted: its dependency code is compiled and tested
+by the build, so the work is two jobs.
+
+- `build` has a read-only token and no secret (the nix action's own token is
+  blanked, and it uses no cache step). It uploads only a
+  diff of tracked `*.nix` files. If the build fails and `fix hashes` changes
+  nothing, the job fails: that is not a stale hash.
+- `push` is the only job that sees the App key, and it never runs nix or
+  anything from the PR. It validates the diff before minting a token: in-place
+  edits of tracked `*.nix` files only (no creates, deletes, renames, mode
+  changes, binaries or symlinks), and with every SRI hash replaced the patched
+  files must equal the originals, so only hash strings can change. The token
+  carries `contents: write` on the calling repo alone, and the push is
+  non-force and skipped if the branch moved.
+
+Residual risk: the content check cannot tell a vendor hash from another
+fixed-output hash, so a tainted build can still swap any SRI hash in a `.nix`
+file it already knows, and code on the `build` runner could write
+default-branch-scoped Actions caches with the job's runtime token. The PR's own CI and review still see the result.
+
 ## Cascade: cascade-notify and cascade-bump
 
 When `main` goes green a sender notifies its consumers; each receiver bumps
