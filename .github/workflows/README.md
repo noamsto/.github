@@ -140,7 +140,7 @@ Trust split. The PR is untrusted: its dependency code is compiled and tested
 by the build, so the work is two jobs.
 
 - `build` has a read-only token and no secret (the nix action's own token is
-  blanked, and it uses no cache a tainted run could poison). It uploads only a
+  blanked, and it uses no cache step). It uploads only a
   diff of tracked `*.nix` files. If the build fails and `fix hashes` changes
   nothing, the job fails: that is not a stale hash.
 - `push` is the only job that sees the App key, and it never runs nix or
@@ -153,7 +153,8 @@ by the build, so the work is two jobs.
 
 Residual risk: the content check cannot tell a vendor hash from another
 fixed-output hash, so a tainted build can still swap any SRI hash in a `.nix`
-file it already knows. The PR's own CI and review still see the result.
+file it already knows, and code on the `build` runner could write
+default-branch-scoped Actions caches with the job's runtime token. The PR's own CI and review still see the result.
 
 ## Cascade: cascade-notify and cascade-bump
 

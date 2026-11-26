@@ -22,8 +22,10 @@ name: Dependabot vendor hash
 # could still swap any SRI hash for one it controls. The token is scoped to
 # `contents: write` on the calling repo only, and the push is non-force.
 #
-# No cache is read or written: pull_request_target caches belong to the default
-# branch, and a tainted runner must not be able to poison them.
+# No cache step is used: pull_request_target caches belong to the default
+# branch. Residual risk: code running on the `build` runner holds the job's
+# runtime token and could still write default-branch-scoped Actions caches
+# without any cache step.
 #
 # The App's own push re-triggers the caller, which then finds the hashes right
 # and ends with nothing to push. Callers must not declare a `concurrency` group
@@ -57,6 +59,8 @@ jobs:
       (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
       && github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
+    # Dependency code runs here; bound how long it can hold the runner.
+    timeout-minutes: 30
     permissions:
       contents: read
     # A newer push to the PR supersedes this run. The push job is protected on
@@ -129,6 +133,7 @@ jobs:
       && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
       && github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     concurrency:
@@ -137,6 +142,9 @@ jobs:
     env:
       HEAD_REF: ${{ github.event.pull_request.head.ref }}
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      # Ignore the runner's system git config (e.g. LFS filters) in every step,
+      # so the committed blobs equal the validated tree.
+      GIT_CONFIG_NOSYSTEM: '1'
     steps:
       # Fresh checkout of the branch the patch will land on. Nothing from it is
       # ever executed: this job runs no nix and no repository script.
@@ -168,8 +176,6 @@ jobs:
       # untrusted data, and do it before any token exists.
       - name: Validate and apply patch
         if: steps.head.outputs.proceed == 'true'
-        env:
-          GIT_CONFIG_NOSYSTEM: '1'
         run: |
           set -u
 
